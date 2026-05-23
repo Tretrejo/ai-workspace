@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Index cache (rebuilt locally, no need to commit)
+.rag_index.pkl
+.agent_memory.json
+
+# macOS
+.DS_Store
+
+# API keys / env files
+.env
+*.env
