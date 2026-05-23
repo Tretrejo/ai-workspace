@@ -3,16 +3,28 @@ Local RAG Knowledge Base MCP Server
 Makes a local folder of documents semantically searchable by Claude.
 Run: python server.py --docs-path ~/Documents/your-notes
 """
-import argparse, hashlib, json, os, pickle, re, time
+import argparse, hashlib, json, logging, os, pickle, re, sys, time
 from pathlib import Path
 from typing import Optional
 import numpy as np
+
+# ── UTF-8 stdout (MCP stdio protocol channel — NOTHING else may write here) ──
+sys.stdout = __import__("io").TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+# ── Silence sentence_transformers and tqdm noise on stderr (safe — not stdout) ──
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
 from fastmcp import FastMCP
 from sentence_transformers import SentenceTransformer
 
 DEFAULT_MODEL = "all-MiniLM-L6-v2"
 CHUNK_SIZE = 512
 SUPPORTED_EXT = {".md", ".txt", ".rst", ".text"}
+
+def _log(msg: str) -> None:
+    """All diagnostic output goes to stderr — never stdout."""
+    print(msg, file=sys.stderr, flush=True)
 
 def extract_text(path: Path) -> Optional[str]:
     ext = path.suffix.lower()
@@ -27,7 +39,7 @@ def extract_text(path: Path) -> Optional[str]:
             doc.close()
             return text
         except ImportError:
-            print(f"  [skip] {path.name} — pip install pymupdf for PDF support")
+            _log(f"  [skip] {path.name} — pip install pymupdf for PDF support")
             return None
     return None
 
@@ -53,7 +65,7 @@ class LocalIndex:
     def __init__(self, docs_path: str, model_name: str = DEFAULT_MODEL):
         self.docs_path = Path(docs_path).expanduser().resolve()
         self.cache_path = self.docs_path / ".rag_index.pkl"
-        print(f"Loading model: {model_name}")
+        _log(f"Loading model: {model_name}")
         self.model = SentenceTransformer(model_name)
         self.chunks: list[dict] = []
         self.embeddings: Optional[np.ndarray] = None
@@ -73,15 +85,15 @@ class LocalIndex:
                 current = {str(p): self._file_hash(p) for p in self._iter_files()}
                 if cached.get("file_hashes") == current:
                     self.chunks, self.embeddings = cached["chunks"], np.array(cached["embeddings"])
-                    print(f"Loaded {len(self.chunks)} chunks from cache")
+                    _log(f"Loaded {len(self.chunks)} chunks from cache")
                     return
             except: pass
         self._build()
 
     def _build(self):
-        print(f"Building index from: {self.docs_path}")
+        _log(f"Building index from: {self.docs_path}")
         files = list(self._iter_files())
-        if not files: print("  No files found."); return
+        if not files: _log("  No files found."); return
         all_chunks, file_hashes = [], {}
         for path in files:
             text = extract_text(path)
@@ -91,13 +103,13 @@ class LocalIndex:
             for i, c in enumerate(chunk(text)):
                 all_chunks.append({"text": c, "source": rel, "chunk_idx": i, "total_chunks": len(chunk(text))})
             file_hashes[str(path)] = self._file_hash(path)
-            print(f"  Indexed: {rel}")
-        if not all_chunks: print("No content extracted."); return
-        embs = self.model.encode([c["text"] for c in all_chunks], show_progress_bar=True, batch_size=64)
+            _log(f"  Indexed: {rel}")
+        if not all_chunks: _log("No content extracted."); return
+        embs = self.model.encode([c["text"] for c in all_chunks], show_progress_bar=False, batch_size=64)
         self.chunks, self.embeddings = all_chunks, np.array(embs)
         pickle.dump({"chunks": self.chunks, "embeddings": self.embeddings.tolist(),
                      "file_hashes": file_hashes, "built_at": time.time()}, open(self.cache_path, "wb"))
-        print(f"Index built: {len(self.chunks)} chunks from {len(file_hashes)} files.")
+        _log(f"Index built: {len(self.chunks)} chunks from {len(file_hashes)} files.")
 
     def search(self, query: str, top_k: int = 5, threshold: float = 0.3) -> list[dict]:
         if not self.chunks or self.embeddings is None: return []
@@ -153,8 +165,8 @@ def main():
     parser.add_argument("--model", default=DEFAULT_MODEL)
     args = parser.parse_args()
     path = Path(args.docs_path).expanduser().resolve()
-    if not path.exists(): print(f"Error: {path} does not exist"); return
-    print(f"\n Local RAG KB MCP — {path}\n")
+    if not path.exists(): _log(f"Error: {path} does not exist"); return
+    _log(f"Local RAG KB MCP — {path}")
     create_server(str(path)).run(transport="stdio")
 
 if __name__ == "__main__":
