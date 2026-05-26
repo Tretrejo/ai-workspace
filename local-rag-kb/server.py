@@ -28,7 +28,12 @@ CHUNK_SIZE = 512
 SUPPORTED_EXT = {".md", ".txt", ".rst", ".text"}
 
 # Bump when the on-disk pickle layout changes — forces a rebuild on next load.
-CACHE_SCHEMA_VERSION = 2  # v1 = chunks+embeddings only; v2 adds BM25 corpus
+# v1 = chunks + embeddings only
+# v2 = adds BM25 corpus
+# v3 = file fingerprints are (mtime_ns, size) tuples, not MD5 hashes —
+#      MD5 hashing every file is O(read_all_bytes) per file, which is
+#      catastrophic over OneDrive; stat() is near-instant.
+CACHE_SCHEMA_VERSION = 3
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 def _tokenize(text: str) -> list[str]:
@@ -95,7 +100,17 @@ class LocalIndex:
         self.bm25_corpus: list[list[str]] = []
         self._load_or_build()
 
-    def _file_hash(self, p: Path) -> str: return hashlib.md5(p.read_bytes()).hexdigest()
+    def _file_fingerprint(self, p: Path) -> tuple:
+        """Fast change-detector: (mtime_ns, size) via stat() — no file read.
+
+        MD5-of-contents (the v1/v2 approach) hits 2,897 files × full read over
+        OneDrive every startup and blocks for minutes. stat()-based
+        fingerprints have the same collision-resistance for the "did this file
+        change since the cache was built?" question and complete in <1s for
+        the whole vault.
+        """
+        s = p.stat()
+        return (s.st_mtime_ns, s.st_size)
 
     def _iter_files(self):
         for p in self.docs_path.rglob("*"):
@@ -110,8 +125,8 @@ class LocalIndex:
                 if cached.get("schema_version") != CACHE_SCHEMA_VERSION:
                     _log(f"Cache schema v{cached.get('schema_version')} != v{CACHE_SCHEMA_VERSION}; rebuilding.")
                 else:
-                    current = {str(p): self._file_hash(p) for p in self._iter_files()}
-                    if cached.get("file_hashes") == current:
+                    current = {str(p): self._file_fingerprint(p) for p in self._iter_files()}
+                    if cached.get("file_fingerprints") == current:
                         self.chunks = cached["chunks"]
                         self.embeddings = np.array(cached["embeddings"])
                         self.bm25_corpus = cached["bm25_corpus"]
@@ -126,7 +141,7 @@ class LocalIndex:
         _log(f"Building index from: {self.docs_path}")
         files = list(self._iter_files())
         if not files: _log("  No files found."); return
-        all_chunks, file_hashes = [], {}
+        all_chunks, file_fingerprints = [], {}
         for path in files:
             text = extract_text(path)
             if not text: continue
@@ -134,7 +149,7 @@ class LocalIndex:
             rel = str(path.relative_to(self.docs_path))
             for i, c in enumerate(chunk(text)):
                 all_chunks.append({"text": c, "source": rel, "chunk_idx": i, "total_chunks": len(chunk(text))})
-            file_hashes[str(path)] = self._file_hash(path)
+            file_fingerprints[str(path)] = self._file_fingerprint(path)
             _log(f"  Indexed: {rel}")
         if not all_chunks: _log("No content extracted."); return
         embs = self.model.encode([c["text"] for c in all_chunks], show_progress_bar=False, batch_size=64)
@@ -147,10 +162,10 @@ class LocalIndex:
             "chunks": self.chunks,
             "embeddings": self.embeddings.tolist(),
             "bm25_corpus": self.bm25_corpus,
-            "file_hashes": file_hashes,
+            "file_fingerprints": file_fingerprints,
             "built_at": time.time(),
         }, open(self.cache_path, "wb"))
-        _log(f"Index built: {len(self.chunks)} chunks from {len(file_hashes)} files (semantic + BM25).")
+        _log(f"Index built: {len(self.chunks)} chunks from {len(file_fingerprints)} files (semantic + BM25).")
 
     def search(self, query: str, top_k: int = 5, threshold: float = 0.3) -> list[dict]:
         if not self.chunks or self.embeddings is None: return []
@@ -257,11 +272,11 @@ def create_server(docs_path: str) -> FastMCP:
     @mcp.tool()
     def search_knowledge_base(query: str, top_k: int = 5, threshold: float = 0.25) -> str:
         """Search your local knowledge base for documents relevant to a query."""
-        index = _get_index(wait_seconds=120.0)
+        index = _get_index(wait_seconds=45.0)
         if state["error"]:
             return f"Index initialization failed: {state['error']}"
         if index is None:
-            return "Index is still building (model load + file hashing). Try again in 30-60 seconds."
+            return "Index is still building (model load + file fingerprinting). Try again in 30-60 seconds."
         results = index.search(query, top_k=min(top_k, 10), threshold=threshold)
         if not results: return f"No results for: '{query}'"
         out = [f"Found {len(results)} results for: '{query}'\n"]
@@ -285,7 +300,7 @@ def create_server(docs_path: str) -> FastMCP:
     @mcp.tool()
     def rebuild_index() -> str:
         """Force a full rebuild of the index after adding/editing files."""
-        index = _get_index(wait_seconds=120.0)
+        index = _get_index(wait_seconds=45.0)
         if state["error"]: return f"Index initialization failed: {state['error']}"
         if index is None: return "Index still initializing — try rebuild after first init completes."
         old = len(index.chunks)
@@ -301,10 +316,10 @@ def create_server(docs_path: str) -> FastMCP:
         'Aptar Cary IL'). The semantic-only tool `search_knowledge_base` is better when the
         query is purely conceptual ('how do renewals work').
         """
-        index = _get_index(wait_seconds=120.0)
+        index = _get_index(wait_seconds=45.0)
         if state["error"]: return f"Index initialization failed: {state['error']}"
         if index is None:
-            return "Index is still building (model load + file hashing). Try again in 30-60 seconds."
+            return "Index is still building (model load + file fingerprinting). Try again in 30-60 seconds."
         results = index.search_hybrid(query, top_k=min(top_k, 10), threshold=threshold)
         if not results: return f"No results for: '{query}'"
         out = [f"Found {len(results)} hybrid results for: '{query}' (RRF score / semantic / BM25)\n"]
@@ -321,7 +336,7 @@ def create_server(docs_path: str) -> FastMCP:
         """Check whether the knowledge-base index is ready."""
         if state["error"]: return f"Index initialization FAILED: {state['error']}"
         index = _get_index()
-        if index is None: return "Index is still building (model load + file hashing). Search tools will wait up to 120s on first call."
+        if index is None: return "Index is still building (model load + file fingerprinting). Search tools will wait up to 45s on first call."
         return f"Index READY. {len(index.chunks)} chunks indexed from {index.docs_path}."
 
     return mcp
