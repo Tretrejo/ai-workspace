@@ -103,14 +103,23 @@ class LocalIndex:
     def _file_fingerprint(self, p: Path) -> tuple:
         """Fast change-detector: (mtime_ns, size) via stat() — no file read.
 
-        MD5-of-contents (the v1/v2 approach) hits 2,897 files × full read over
-        OneDrive every startup and blocks for minutes. stat()-based
+        MD5-of-contents (the v1/v2 approach) hits every indexed file × full
+        read over OneDrive every startup and blocks for minutes. stat()-based
         fingerprints have the same collision-resistance for the "did this file
         change since the cache was built?" question and complete in <1s for
         the whole vault.
+
+        Returns sentinel (0, 0) if stat fails — e.g. on Windows files whose
+        absolute path exceeds 260 chars and long-path support is disabled.
+        The same sentinel is written at build time and read at validate time,
+        so the comparison is still consistent (we just can't detect edits to
+        those specific files; a manual `rebuild_index()` covers it).
         """
-        s = p.stat()
-        return (s.st_mtime_ns, s.st_size)
+        try:
+            s = p.stat()
+            return (s.st_mtime_ns, s.st_size)
+        except (OSError, ValueError):
+            return (0, 0)
 
     def _iter_files(self):
         for p in self.docs_path.rglob("*"):
@@ -199,11 +208,19 @@ class LocalIndex:
         candidate_pool: int = 50,
         rrf_k: int = 60,
         threshold: float = 0.0,
+        bm25_min_score: float = 0.5,
+        sem_min_score: float = 0.10,
     ) -> list[dict]:
         """Hybrid search: union top-N candidates from BM25 and semantic, fuse via RRF.
 
         Reciprocal Rank Fusion: rrf_score(d) = sum(1 / (k + rank_d_in_list)) across the
         two ranked lists. Robust to score-scale differences between BM25 and cosine.
+
+        Per-list min-score gates: a result only contributes to a list's rank vote if
+        its raw score exceeds the gate. This prevents the "exact-identifier query
+        returns ties between the real hit and unrelated noise" failure mode — when
+        BM25 has zero matches for a doc, that doc shouldn't get RRF credit from BM25
+        equal to a doc that genuinely matched.
         """
         if not self.chunks: return []
         sem_scores = self._semantic_scores(query)
@@ -211,14 +228,15 @@ class LocalIndex:
         if sem_scores.size == 0 and bm25_scores.size == 0:
             return []
 
-        # Per-list rank lookups (1-indexed): missing-from-list = no contribution.
-        def _ranked_indices(scores: np.ndarray, n: int) -> list[int]:
+        def _ranked_indices(scores: np.ndarray, n: int, min_score: float) -> list[int]:
+            """Return up to n indices by score desc, dropping any below min_score."""
             if scores.size == 0: return []
             order = np.argsort(-scores)
-            return order[:n].tolist()
+            filtered = [int(i) for i in order if float(scores[i]) > min_score]
+            return filtered[:n]
 
-        sem_top = _ranked_indices(sem_scores, candidate_pool)
-        bm25_top = _ranked_indices(bm25_scores, candidate_pool)
+        sem_top = _ranked_indices(sem_scores, candidate_pool, sem_min_score)
+        bm25_top = _ranked_indices(bm25_scores, candidate_pool, bm25_min_score)
 
         rrf: dict[int, float] = {}
         for rank, idx in enumerate(sem_top, start=1):
