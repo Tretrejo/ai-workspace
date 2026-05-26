@@ -4,6 +4,9 @@ Agent with persistent memory. Run: python agent.py "your question"
 Env: ANTHROPIC_API_KEY=your-key
 """
 import os, re, sys
+from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).with_name(".env"), override=True)
 import anthropic
 from src.memory import AgentMemory, MemoryType
 

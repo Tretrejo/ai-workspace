@@ -8,6 +8,8 @@ import argparse, os, sys
 from datetime import datetime
 from pathlib import Path
 from textwrap import dedent
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).with_name(".env"), override=True)
 import anthropic, feedparser, httpx
 
 DEFAULT_FEEDS = [
