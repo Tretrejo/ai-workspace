@@ -127,12 +127,40 @@ class LocalIndex:
         self._build()
 
 def create_server(docs_path: str) -> FastMCP:
-    index = LocalIndex(docs_path)
+    # Lazy/background index init so MCP handshake (60s timeout) is never blocked
+    # by model load + file-hash checks against OneDrive (which can take >60s).
+    import threading
+    state = {"index": None, "error": None, "ready": threading.Event()}
+
+    def _build_in_background():
+        try:
+            state["index"] = LocalIndex(docs_path)
+        except Exception as e:
+            state["error"] = repr(e)
+            _log(f"Index init failed: {e}")
+        finally:
+            state["ready"].set()
+
+    threading.Thread(target=_build_in_background, daemon=True).start()
+
+    def _get_index(wait_seconds: float = 0.0):
+        """Return index, or None if not ready yet."""
+        if state["ready"].is_set():
+            return state["index"]
+        if wait_seconds > 0:
+            state["ready"].wait(timeout=wait_seconds)
+        return state["index"] if state["ready"].is_set() else None
+
     mcp = FastMCP("local-rag-kb")
 
     @mcp.tool()
     def search_knowledge_base(query: str, top_k: int = 5, threshold: float = 0.25) -> str:
         """Search your local knowledge base for documents relevant to a query."""
+        index = _get_index(wait_seconds=120.0)
+        if state["error"]:
+            return f"Index initialization failed: {state['error']}"
+        if index is None:
+            return "Index is still building (model load + file hashing). Try again in 30-60 seconds."
         results = index.search(query, top_k=min(top_k, 10), threshold=threshold)
         if not results: return f"No results for: '{query}'"
         out = [f"Found {len(results)} results for: '{query}'\n"]
@@ -143,6 +171,9 @@ def create_server(docs_path: str) -> FastMCP:
     @mcp.tool()
     def list_indexed_files() -> str:
         """List all files currently indexed in the knowledge base."""
+        index = _get_index(wait_seconds=10.0)
+        if state["error"]: return f"Index initialization failed: {state['error']}"
+        if index is None: return "Index still initializing — try again shortly."
         if not index.chunks: return f"Empty. No files in: {index.docs_path}"
         from collections import Counter
         fc = Counter(c["source"] for c in index.chunks)
@@ -153,9 +184,20 @@ def create_server(docs_path: str) -> FastMCP:
     @mcp.tool()
     def rebuild_index() -> str:
         """Force a full rebuild of the index after adding/editing files."""
+        index = _get_index(wait_seconds=120.0)
+        if state["error"]: return f"Index initialization failed: {state['error']}"
+        if index is None: return "Index still initializing — try rebuild after first init completes."
         old = len(index.chunks)
         index.rebuild()
         return f"Rebuilt. Before: {old} chunks. After: {len(index.chunks)} chunks."
+
+    @mcp.tool()
+    def index_status() -> str:
+        """Check whether the knowledge-base index is ready."""
+        if state["error"]: return f"Index initialization FAILED: {state['error']}"
+        index = _get_index()
+        if index is None: return "Index is still building (model load + file hashing). Search tools will wait up to 120s on first call."
+        return f"Index READY. {len(index.chunks)} chunks indexed from {index.docs_path}."
 
     return mcp
 
